@@ -54,10 +54,20 @@ jobs:
               jq -nc --arg u "$URL" --arg s "$SHA" --arg t "$TOKEN" \
                 '{artifact_url:$u,pages_build_version:$s,oidc_token:$t,environment:"github-pages"}' > body.json
             fi
-            T0=$(date +%s)
-            CODE=$(curl -s -o resp.json -w '%{http_code}' -X POST -H "$AH" -H "$AC" "$API/pages/deployments" -d @body.json)
-            DID=$(jq -r '.id // "none"' resp.json); SURL=$(jq -r '.status_url // empty' resp.json)
-            MSG=$(jq -r '.message // ""' resp.json)
+            # POST with retry: Pages SERIALIZES deployments per repo, a 400 "in progress" is VOID not negative
+            TRIES=0
+            while : ; do
+              T0=$(date +%s)
+              CODE=$(curl -s -o resp.json -w '%{http_code}' -X POST -H "$AH" -H "$AC" "$API/pages/deployments" -d @body.json)
+              DID=$(jq -r '.id // "none"' resp.json); SURL=$(jq -r '.status_url // empty' resp.json)
+              MSG=$(jq -r '.message // ""' resp.json)
+              case "$MSG" in *"in progress deployment"*) ;; *) break;; esac
+              TRIES=$((TRIES+1)); [ "$TRIES" -ge 40 ] && break
+              PREV=$(echo "$MSG" | grep -oE 'cancel [0-9a-f]{40}' | awk '{print $2}')
+              [ -n "$PREV" ] && curl -s -o /dev/null -X POST -H "$AH" -H "$AC" "$API/pages/deployments/$PREV/cancel"
+              sleep 6
+            done
+            echo "  ($NAME post_retries=$TRIES)"
             if [ -z "$SURL" ]; then
               echo "RESULT|$NAME|post=$CODE|sha=${SHA:0:8}|deployment=$DID|terminal=NO_STATUS_URL|elapsed=0|msg=$MSG"
               return
@@ -72,6 +82,7 @@ jobs:
               [ "$i" = "150" ] && CENSORED=yes
             done
             EL=$(( $(date +%s) - T0 ))
+            curl -s -o /dev/null -X POST -H "$AH" -H "$AC" "$API/pages/deployments/$DID/cancel"
             echo "RESULT|$NAME|post=$CODE|sha=${SHA:0:8}|deployment=${DID:0:12}|terminal=$ST|elapsed=${EL}s|censored=$CENSORED|msg=$MSG"
           }
 
