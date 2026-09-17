@@ -92,9 +92,18 @@ jobs:
 
           echo "########## ARMS BEGIN ##########"
           arm VALCTRL-canary-url-alone no  "$CANARY"
-          arm CANARY-1                 yes "$CANARY"
-          arm SIBLING-1                yes "$SIBLING"
-          arm CANARY-2                 yes "$CANARY"
-          arm SIBLING-2                yes "$SIBLING"
+          # interleaved pairs; EACH sibling gets a FRESH RANDOM never-before-queried name so a
+          # negative-DNS-cache entry cannot make rep 2+ artificially fast.
+          for r in 1 2 3 4; do
+            R=$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')
+            FRESH="https://zz-nx-$R.iad.github.net$PATHSEG"
+            if [ $((r % 2)) -eq 1 ]; then
+              arm "CANARY-r$r"  yes "$CANARY"
+              arm "SIBLING-r$r" yes "$FRESH"
+            else
+              arm "SIBLING-r$r" yes "$FRESH"
+              arm "CANARY-r$r"  yes "$CANARY"
+            fi
+          done
           arm NXDOM-anchor             yes "$NXDOM"
           echo "########## ARMS END ##########"
